@@ -1,4 +1,4 @@
-name: Build Pikafish master Windows
+name: Build Pikafish XQ Rules
 
 on:
   push:
@@ -20,32 +20,23 @@ jobs:
           msystem: clang64
           install: mingw-w64-clang-x86_64-clang make git
 
-      - name: Get master source
-        shell: msys2 {0}
-        run: |
-          curl -sL https://codeload.github.com/official-pikafish/Pikafish/tar.gz/refs/heads/master -o src.tar.gz
-          tar -xzf src.tar.gz
-          mv Pikafish-master pkf
-          ls pkf/src
-
       - name: Apply XQ rule patch
-        working-directory: pkf
         shell: msys2 {0}
         run: |
-          sed -i 's/\r$//' ../xq-rule.patch
-          git apply --verbose ../xq-rule.patch
+          sed -i 's/\r$//' xq-rule.patch
+          git apply --verbose xq-rule.patch
 
       - name: Build
-        working-directory: pkf/src
+        working-directory: src
         shell: msys2 {0}
         run: make -j4 build EXE=pikafish-master.exe
 
       - name: Strip
-        working-directory: pkf/src
+        working-directory: src
         shell: msys2 {0}
         run: make strip EXE=pikafish-master.exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Pikafish-Windows-x86-64-universal
-          path: pkf/src/pikafish-master.exe
+          name: Pikafish-XQ-Windows-x86-64-universal
+          path: src/pikafish-master.exe
