@@ -1,0 +1,291 @@
+--- a/src/position.h
++++ b/src/position.h
+@@ -42,6 +42,11 @@
+ class TranspositionTable;
+ struct SharedHistories;
+ 
++// XQ repetition-rule options, set from the UCI layer (engine.cpp)
++extern bool ChineseRule;
++extern bool SkyRule;
++extern int  MateThreatDepth;
++
+ // StateInfo struct stores information needed to restore a Position object to
+ // its previous state when we retract a move. Whenever a move is made on the
+ // board (by calling Position::do_move), a StateInfo object must be passed.
+@@ -195,6 +200,7 @@
+     void                  undo_move(Move m, Piece captured, int id = 0);
+     Value                 detect_chases(int d, int ply = 0);
+     bool                  chase_legal(Move m) const;
++    bool                  has_mate_threat(Depth d = -1);
++    void                  update_sky_chase_state(StateInfo* st, Color us);
+     template<bool AfterMove = false>
+     Key adjust_key60(Key k) const;
+ 
+--- a/src/position.cpp
++++ b/src/position.cpp
+@@ -47,6 +47,11 @@
+ 
+ using namespace Attacks;
+ 
++// XQ repetition-rule option state (defaults: Asian rule)
++bool ChineseRule    = false;
++bool SkyRule        = false;
++int  MateThreatDepth = 1;
++
+ namespace Zobrist {
+ 
+ Key psq[PIECE_NB][SQUARE_NB];
+@@ -1246,12 +1251,19 @@
+     Color us = sideToMove, them = ~us;
+ 
+     // Rollback until we reached st - d
+-    u16 chase[COLOR_NB] = {0xFFFF, 0xFFFF};
++    u16 rooks[COLOR_NB]    = {0xFFFF, 0xFFFF};
++    u16 chase[COLOR_NB]     = {0xFFFF, 0xFFFF};
++    u16 newChase[COLOR_NB] = {};
++    newChase[us] = chased(us);
++    bool sideHasCheck[COLOR_NB] = {};
++    int checkPieceCount[COLOR_NB] = {};
++    Bitboard checkPieces[COLOR_NB] = {};
++    int chaseStreak[COLOR_NB] = {};
+     for (int i = 0; i < d; ++i)
+     {
+-        if (st->checkersBB)
+-            return VALUE_DRAW;
+-        else if (!chase[~sideToMove])
++        if (!chase[~sideToMove])
+         {
+             if (!chase[sideToMove])
+                 break;
+@@ -1260,19 +1272,110 @@
+         }
+         else
+         {
+-            u16 after = chased(~sideToMove);
+-            undo_move(st->move, st->capturedPiece);
+-            st = st->previous;
+-            // Take the exact diff to detect the chase
+-            chase[sideToMove] &= after & ~chased(sideToMove);
++            bool isCheck = bool(st->checkersBB);
++
++            if (isCheck)
++            {
++                sideHasCheck[~sideToMove] = true;
++                checkPieces[~sideToMove] |= st->checkersBB;
++                checkPieceCount[~sideToMove] = popcount(checkPieces[~sideToMove]);
++                chase[~sideToMove] &= 0xFFFF;
++                rooks[~sideToMove]   = 0;
++                undo_move(st->move, st->capturedPiece);
++                st = st->previous;
++            }
++            else if (ChineseRule && MateThreatDepth && has_mate_threat())
++            {
++                chase[~sideToMove] &= 0xFFFF;
++                rooks[~sideToMove]   = 0;
++                undo_move(st->move, st->capturedPiece);
++                st = st->previous;
++            }
++            else
++            {
++                u16 oldChase = chased(~sideToMove);
++                bool isEvasion = SkyRule && sideHasCheck[sideToMove] && i > 0;
++
++                u16 flag = 0;
++                if (!ChineseRule && !SkyRule && rooks[~sideToMove]
++                    && (blockers_for_king(sideToMove) & pieces(sideToMove, ROOK)))
++                {
++                    Bitboard knights = pinners(~sideToMove) & pieces(~sideToMove, KNIGHT);
++                    while (knights)
++                    {
++                        Square s = pop_lsb(knights);
++                        Bitboard b = between_bb(king_square(sideToMove), s) ^ s;
++                        s = pop_lsb(b);
++                        if (piece_on(s) == make_piece(sideToMove, ROOK))
++                            flag |= 1 << idBoard[s];
++                    }
++                }
++
++                undo_move(st->move, st->capturedPiece);
++                st = st->previous;
++
++                u16 chases;
++                if (ChineseRule)
++                    chases = oldChase & ~newChase[sideToMove];
++                else if (SkyRule)
++                {
++                    if (isEvasion)
++                        chases = 0;
++                    else
++                        chases = oldChase;
++                }
++                else if (i == d - 2)
++                    chases = oldChase & ~newChase[sideToMove];
++                else
++                    chases = oldChase & ~newChase[sideToMove];
++
++                newChase[sideToMove] = chased(sideToMove);
++                rooks[sideToMove] &= chases & flag;
++
++                if (SkyRule && chases)
++                    chaseStreak[sideToMove]++;
++
++                chase[sideToMove] &= (ChineseRule && chases) ? 0xFFFF : chases;
++            }
+         }
+     }
+ 
+-    return bool(chase[us]) ^ bool(chase[them]) ? chase[us] ? mated_in(ply) : mate_in(ply)
+-                                               : VALUE_DRAW;
++    if (SkyRule)
++    {
++        u16 preCycleChaseWhite = chased(WHITE);
++        u16 preCycleChaseBlack = chased(BLACK);
++
++        u16 totalChaseWhite = chase[WHITE] | preCycleChaseBlack;
++        u16 totalChaseBlack = chase[BLACK] | preCycleChaseWhite;
++        int totalChaseCountWhite = popcount(totalChaseWhite);
++        int totalChaseCountBlack = popcount(totalChaseBlack);
++
++        bool parallelDefenseWhite = checkPieceCount[BLACK] > 1;
++        bool parallelDefenseBlack = checkPieceCount[WHITE] > 1;
++
++        bool redCounterChase = bool(chase[WHITE] & preCycleChaseBlack);
++        bool blackCounterChase = bool(chase[BLACK] & preCycleChaseWhite);
++
++        int limit[COLOR_NB];
++        limit[WHITE] = checkPieceCount[WHITE] * 6;
++        limit[BLACK] = checkPieceCount[BLACK] * 6;
++
++        bool redCheckOver = sideHasCheck[WHITE] && checkPieceCount[WHITE] > 0 && d / 2 >= limit[WHITE];
++        bool blackCheckOver = sideHasCheck[BLACK] && checkPieceCount[BLACK] > 0 && d / 2 >= limit[BLACK];
++
++        bool redIllegal = (totalChaseCountWhite == 1) || (totalChaseCountWhite > 1 && sideHasCheck[BLACK]);
++        bool blackIllegal = (totalChaseCountBlack == 1) || (totalChaseCountBlack > 1 && sideHasCheck[WHITE]);
++
++        if (parallelDefenseWhite && totalChaseCountWhite > 1)
++            redIllegal = true;
++        if (parallelDefenseBlack && totalChaseCountBlack > 1)
++            blackIllegal = true;
++
++        if (redCounterChase)
++            redIllegal = false;
++        if (blackCounterChase)
++            blackIllegal = false;
++
++        bool redStreakOver = chaseStreak[WHITE] >= 6;
++        bool blackStreakOver = chaseStreak[BLACK] >= 6;
++
++        if (redStreakOver && !blackStreakOver)
++            return mated_in(ply);
++        if (blackStreakOver && !redStreakOver)
++            return mate_in(ply);
++
++        if (redCheckOver && !blackCheckOver)
++            return mated_in(ply);
++        if (blackCheckOver && !redCheckOver)
++            return mate_in(ply);
++
++        if (!redIllegal && !blackIllegal)
++            return VALUE_DRAW;
++
++        if (!redIllegal)
++            return mate_in(ply);
++        if (!blackIllegal)
++            return mated_in(ply);
++
++        return (us == WHITE) ? mated_in(ply) : mate_in(ply);
++    }
++
++    if ((!chase[us] && !chase[them]) || (rooks[us] && rooks[them]))
++        return VALUE_DRAW;
++    else if (rooks[us])
++        return mated_in(ply);
++    else if (rooks[them])
++        return mate_in(ply);
++
++    return !chase[us] ? mate_in(ply) : !chase[them] ? mated_in(ply) : VALUE_DRAW;
+ }
+ 
+ 
++bool Position::has_mate_threat(Depth d) {
++    bool mateThreat = false;
++    if (d == -1)
++    {
++        StateInfo nullSt;
++        do_null_move(nullSt);
++        mateThreat = has_mate_threat(0);
++        undo_null_move();
++    }
++    else if (d < MateThreatDepth)
++    {
++        StateInfo tempSt[2];
++        for (const auto& check : MoveList<LEGAL>(*this))
++        {
++            if (gives_check(check))
++            {
++                do_move(check, tempSt[0]);
++                bool solvable = false;
++                for (const auto& evasion : MoveList<LEGAL>(*this))
++                {
++                    do_move(evasion, tempSt[1]);
++                    solvable = !has_mate_threat(d + 1);
++                    undo_move(evasion);
++                    if (solvable)
++                        break;
++                }
++                undo_move(check);
++                if (!solvable)
++                    return true;
++            }
++        }
++    }
++    return mateThreat;
++}
++
++void Position::update_sky_chase_state(StateInfo* st, Color us) {
++    if (!SkyRule)
++        return;
++    Color them = ~us;
++    u16 currentChases = chased(them);
++    if (!currentChases)
++        return;
++}
++
+ // Tests whether the position may end the game by rule 60, insufficient material, draw repetition,
+ // perpetual check repetition or perpetual chase repetition that allows a player to claim a game result.
+ bool Position::rule_judge(Value& result, int ply) {
+--- a/src/engine.cpp
++++ b/src/engine.cpp
+@@ -106,6 +106,18 @@
+ 
+     options.add("nodestime", Option(0, 0, 10000));
+ 
++    options.add("Mate Threat Depth", Option(1, 0, 10, [](const Option& o) {
++        MateThreatDepth = int(o);
++        return std::nullopt;
++    }));
++
++    options.add("Repetition Rule", Option("AsianRule var AsianRule var ChineseRule var SkyRule", "AsianRule",
++      [](const Option& o) {
++          ChineseRule = (o == "ChineseRule");
++          SkyRule = (o == "SkyRule");
++          return std::nullopt;
++      }));
++
+     options.add("UCI_ShowWDL", Option(false));
+ 
+     options.add(  //
+--- a/src/ucioption.cpp
++++ b/src/ucioption.cpp
+@@ -163,7 +163,11 @@
+         std::string        token;
+         std::istringstream ss(defaultValue);
+         while (ss >> token)
++        {
++            if (token == "var" || comboMap.count(token))
++                continue;
+             comboMap.add(token, Option());
++        }
+         if (!comboMap.count(v) || v == "var")
+             return *this;
+     }
