@@ -106,6 +106,17 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
 
     options.add("nodestime", Option(0, 0, 10000));
 
+    options.add("Mate Threat Depth", Option(1, 0, 10, [](const Option& o) {
+        MateThreatDepth = int(o);
+        return std::nullopt;
+    }));
+
+    options.add("Repetition Rule", Option("AsianRule var AsianRule var ChineseRule", "AsianRule",
+      [](const Option& o) {
+          ChineseRule = (o == "ChineseRule");
+          return std::nullopt;
+      }));
+
     options.add("UCI_ShowWDL", Option(false));
 
     options.add(  //

@@ -42,6 +42,10 @@ namespace Stockfish {
 class TranspositionTable;
 struct SharedHistories;
 
+// XQ repetition-rule options, set from the UCI layer (engine.cpp)
+extern bool ChineseRule;
+extern int  MateThreatDepth;
+
 // StateInfo struct stores information needed to restore a Position object to
 // its previous state when we retract a move. Whenever a move is made on the
 // board (by calling Position::do_move), a StateInfo object must be passed.
@@ -195,6 +199,7 @@ class Position {
     void                  undo_move(Move m, Piece captured, int id = 0);
     Value                 detect_chases(int d, int ply = 0);
     bool                  chase_legal(Move m) const;
+    bool                  has_mate_threat(Depth d = -1);
     template<bool AfterMove = false>
     Key adjust_key60(Key k) const;
 
@@ -276,9 +281,9 @@ inline Bitboard Position::attacks_by(Color c) const {
     Bitboard attackers = pieces(c, Pt);
     while (attackers)
         if (Pt == PAWN)
-            threats |= Attacks::attacks_bb(PAWN, pop_lsb(attackers), c);
+            threats |= Attacks::attacks_bb<PAWN>(pop_lsb(attackers), c);
         else
-            threats |= Attacks::attacks_bb(Pt, pop_lsb(attackers), pieces());
+            threats |= Attacks::attacks_bb<Pt>(pop_lsb(attackers), pieces());
     return threats;
 }
 
